@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -17,6 +18,9 @@ const defaultMergedName = "merge_reorder.pcapng"
 
 type options struct {
 	imsi, msisdn  string
+	imei, mtmsi   string
+	tmsiVal       uint32
+	hasTMSI       bool
 	dir, file     string
 	out, merged   string
 	binDir        string
@@ -47,7 +51,9 @@ With --dir, all *.pcap / *.pcapng files are merged (mergecap) and reordered
 (reordercap) into <dir>/merge_reorder.pcapng before analysis.`,
 		Example: `  gshark usertrack --imsi 440101234567890 --dir ./captures
   gshark usertrack --msisdn 819012345678 --file trace.pcapng -o user.pcapng
-  gshark usertrack -i 440101234567890 -f trace.pcapng --no-userplane --show-filter`,
+  gshark usertrack -i 440101234567890 -f trace.pcapng --no-userplane --show-filter
+  gshark usertrack --imei 35209900176148 --dir ./captures
+  gshark usertrack --m-tmsi 0x21de4747 --file trace.pcapng`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := o.validate(); err != nil {
@@ -63,6 +69,8 @@ With --dir, all *.pcap / *.pcapng files are merged (mergecap) and reordered
 	f := cmd.Flags()
 	f.StringVarP(&o.imsi, "imsi", "i", "", "IMSI (14-15 digits, e.g. 440101234567890)")
 	f.StringVarP(&o.msisdn, "msisdn", "m", "", "MSISDN in international format without '+' (e.g. 819012345678)")
+	f.StringVar(&o.imei, "imei", "", "IMEI (15 digits) or IMEISV (16 digits); '-' allowed (e.g. 35-209900-176148-1)")
+	f.StringVar(&o.mtmsi, "m-tmsi", "", "M-TMSI in hex (e.g. 0x21de4747, 21de4747 or 21:de:47:47)")
 	f.StringVarP(&o.dir, "dir", "d", "", "directory containing *.pcap / *.pcapng (merged and reordered)")
 	f.StringVarP(&o.file, "file", "f", "", "single capture file")
 	f.StringVarP(&o.out, "out", "o", "", "output pcapng (default ./gshark_<imsi|msisdn>.pcapng)")
@@ -79,7 +87,7 @@ With --dir, all *.pcap / *.pcapng files are merged (mergecap) and reordered
 	f.BoolVar(&o.showFilter, "show-filter", false, "print the complete display filter")
 	f.BoolVarP(&o.verbose, "verbose", "v", false, "print executed commands")
 
-	cmd.MarkFlagsOneRequired("imsi", "msisdn")
+	cmd.MarkFlagsOneRequired("imsi", "msisdn", "imei", "m-tmsi")
 	cmd.MarkFlagsOneRequired("dir", "file")
 	cmd.MarkFlagsMutuallyExclusive("dir", "file")
 	return cmd
@@ -94,6 +102,19 @@ func (o *options) validate() error {
 	if o.msisdn != "" && (!digits.MatchString(o.msisdn) || len(o.msisdn) < 5 || len(o.msisdn) > 15) {
 		return fmt.Errorf("MSISDN must be 5-15 digits (international format, no '+'): %q", o.msisdn)
 	}
+	o.imei = strings.NewReplacer("-", "", " ", "").Replace(o.imei)
+	if o.imei != "" && (!digits.MatchString(o.imei) || len(o.imei) < 14 || len(o.imei) > 16) {
+		return fmt.Errorf("IMEI must be 14-16 digits (IMEI 15 / IMEISV 16): %q", o.imei)
+	}
+	if o.mtmsi != "" {
+		h := strings.ToLower(strings.NewReplacer(":", "", " ", "").Replace(o.mtmsi))
+		h = strings.TrimPrefix(h, "0x")
+		v, err := strconv.ParseUint(h, 16, 32)
+		if h == "" || err != nil {
+			return fmt.Errorf("M-TMSI must be up to 8 hex digits (e.g. 0x21de4747): %q", o.mtmsi)
+		}
+		o.tmsiVal, o.hasTMSI = uint32(v), true
+	}
 	if o.maxRounds < 1 {
 		o.maxRounds = 1
 	}
@@ -101,6 +122,12 @@ func (o *options) validate() error {
 		id := o.imsi
 		if id == "" {
 			id = o.msisdn
+		}
+		if id == "" {
+			id = o.imei
+		}
+		if id == "" {
+			id = fmt.Sprintf("mtmsi_%08x", o.tmsiVal)
 		}
 		o.out = "gshark_" + id + ".pcapng"
 	}
@@ -194,16 +221,23 @@ func runUsertrack(o *options) int {
 	}
 
 	cat := loadCatalog(tsharkBin)
-	var cols []string
+	var cols, missing []string
 	for _, c := range keyColumns {
 		if cat.Has(c) {
 			cols = append(cols, c)
-		} else if o.verbose {
-			fmt.Fprintf(os.Stderr, "note: field %s not supported by this tshark; skipped\n", c)
+		} else {
+			missing = append(missing, c)
 		}
 	}
+	if len(missing) > 0 {
+		fmt.Fprintf(os.Stderr, "note: fields not available in this tshark (skipped): %s\n", strings.Join(missing, ", "))
+	}
 	tr := &tsharkRunner{bin: tsharkBin, extra: o.extra, twoPass: !o.singlePass, verbose: o.verbose}
-	keys := newKeys(o.imsi, o.msisdn, o.resolveWindow)
+	keys := newKeys(o.imsi, o.msisdn, o.imei, o.resolveWindow)
+	keys.cat = cat
+	if o.hasTMSI {
+		keys.addTMSI(o.tmsiVal, false)
+	}
 
 	var st roundStats
 	var filter string
@@ -354,6 +388,23 @@ func printReport(o *options, input string, nFiles int, filterFile string, k *Key
 	}
 	idLine("IMSI", k.imsi, k.autoIMSI)
 	idLine("MSISDN", k.msisdn, k.autoMSISDN)
+	if len(k.imei) > 0 {
+		idLine("IMEI/IMEISV (given)", k.imei, false)
+	}
+	if len(k.seenIMEI) > 0 {
+		idLine("IMEI/IMEISV (observed)", k.seenIMEI, false)
+	}
+	if len(k.tmsis) > 0 {
+		s := set{}
+		for v, auto := range k.tmsis {
+			label := fmt.Sprintf("0x%08x", v)
+			if auto {
+				label += " (auto)"
+			}
+			s.add(label)
+		}
+		idLine("M-TMSI", s, false)
+	}
 	w.Flush()
 
 	sub("Packets by protocol (a packet may count for several)")
@@ -378,7 +429,7 @@ func printReport(o *options, input string, nFiles int, filterFile string, k *Key
 		fmt.Fprintf(w, "SCTP assoc\t%s\t%s\n", ranName, coreName)
 		listed := set{}
 		for _, p := range u.sortedPairs() {
-			fmt.Fprintf(w, "%s\t%s\t%s\n", dash(p[0]), p[1], p[2])
+			fmt.Fprintf(w, "%s\t%s\t%s\n", dash(p[0]), p[1], dash(p[2]))
 			listed.add(p[2])
 		}
 		for _, c := range u.core.sorted() {

@@ -37,7 +37,7 @@ func (t toolset) find(name string) (string, error) {
 
 func logCmd(name string, args []string) {
 	var b strings.Builder
-	b.WriteString("$ " + filepath.Base(name))
+	_, _ = b.WriteString("$ " + filepath.Base(name))
 	for _, a := range args {
 		if len(a) > 160 {
 			a = a[:160] + "...(truncated)"
@@ -45,7 +45,7 @@ func logCmd(name string, args []string) {
 		if strings.ContainsAny(a, " \t\"'()|&<>") {
 			a = "'" + a + "'"
 		}
-		b.WriteString(" " + a)
+		_, _ = b.WriteString(" " + a)
 	}
 	fmt.Fprintln(os.Stderr, b.String())
 }
@@ -78,11 +78,11 @@ func tail(s string, n int) string {
 
 type catalog struct {
 	all   bool
-	names map[string]struct{}
+	names map[string]string // field/protocol name -> FT_* type ("" for protocols)
 }
 
 func loadCatalog(tshark string) *catalog {
-	c := &catalog{names: map[string]struct{}{}}
+	c := &catalog{names: map[string]string{}}
 	out, err := exec.Command(tshark, "-G", "fields").Output()
 	if err != nil {
 		c.all = true // cannot verify; assume everything exists
@@ -93,10 +93,38 @@ func loadCatalog(tshark string) *catalog {
 	for sc.Scan() {
 		p := strings.Split(sc.Text(), "\t")
 		if len(p) > 2 && (p[0] == "F" || p[0] == "P") {
-			c.names[p[2]] = struct{}{}
+			typ := ""
+			if p[0] == "F" && len(p) > 3 {
+				typ = p[3]
+			}
+			c.names[p[2]] = typ
 		}
 	}
 	return c
+}
+
+// kind classifies a field: "bytes", "uint", "string" or "" (unknown/other).
+func (c *catalog) kind(name string) string {
+	if c.all {
+		return ""
+	}
+	switch typ := c.names[name]; typ {
+	case "FT_BYTES", "FT_UINT_BYTES":
+		return "bytes"
+	case "FT_STRING", "FT_STRINGZ", "FT_STRINGZPAD", "FT_UINT_STRING":
+		return "string"
+	case "FT_UINT8", "FT_UINT16", "FT_UINT24", "FT_UINT32", "FT_UINT40", "FT_UINT48", "FT_UINT56", "FT_UINT64":
+		return "uint"
+	}
+	return ""
+}
+
+// isString reports whether the field exists and can be used with string operators.
+func (c *catalog) isString(name string) bool {
+	if !c.Has(name) {
+		return false
+	}
+	return c.all || c.kind(name) == "string"
 }
 
 func (c *catalog) Has(name string) bool {
@@ -116,6 +144,16 @@ type row struct{ v map[string][]string }
 func (r row) first(name string) string {
 	if l := r.v[name]; len(l) > 0 {
 		return l[0]
+	}
+	return ""
+}
+
+// firstOf returns the first non-empty value among several field name variants.
+func (r row) firstOf(names []string) string {
+	for _, n := range names {
+		if v := r.first(n); v != "" {
+			return v
+		}
 	}
 	return ""
 }
