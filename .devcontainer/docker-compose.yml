@@ -1,0 +1,8 @@
+services:
+  gshark-dev:
+    image: golang:1.27.3
+    container_name: gshark-dev
+    hostname: gshark-dev
+    volumes:
+      - ..:/workspace:cached
+    command: /bin/sh -c "while :; do sleep 10; done"
